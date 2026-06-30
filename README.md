@@ -452,5 +452,34 @@ noted as such):
   snapshot), `--offload-lm`, `--kernel-backend`, `--trunk-layers/--msa-layers`,
   `--opm-chunk`.
 
-Net (float32, A6000): **H2343 142 → 105 s, H1382 470 → 285 s** with lower peak
-memory and unchanged outputs.
+## Key benchmark results
+
+All on a single NVIDIA A6000 (48 GB), float32, outputs unchanged (pTM/pLDDT within
+run-to-run noise).
+
+**End-to-end forward** (standard model, 16 recycles, `--offload-lm`):
+
+| target | residues | stock cueq | + cueq-MSA + OPM-chunk (ours) | speedup |
+|---|---:|---:|---:|---:|
+| H2343 | 773 | 123.8 s | **105.5 s** | 1.17× |
+| H1382 | 1378 | 469.8 s | **284.8 s** | **1.65×** |
+
+**Per-component** (the levers behind the above):
+
+| component | stock | optimized | speedup |
+|---|---:|---:|---:|
+| trunk trimul — cuEquivariance kernel (enabled) | 557 ms/block | 72.5 ms/block | **7.7×** |
+| MSA encoder — **cueq-MSA** (ours), H2343 | 2.45 s/iter | 0.50 s/iter | **4.9×** |
+| MSA encoder — **cueq-MSA** (ours), H1382 | 12.45 s/iter | 1.48 s/iter | **8.4×** |
+
+**Memory / feasibility:**
+
+| lever | effect |
+|---|---|
+| ESM-C CPU offload (ours) | trunk-phase peak GPU **33.5 → 9.6 GB** (frees ~24 GB) |
+| cueq-MSA (ours) | H1382 MSA-encoder peak **32.1 → 23.4 GB** |
+| MSA OPM chunking (ours) | H2340 @ 2046 res: **OOM → runs** (removes an 8.08 GiB transient) |
+
+The trunk speedup comes from the built-in cuEquivariance kernels we *enabled*; the
+**MSA-encoder, memory, and large-complex feasibility wins are this fork's additions**
+(cueq-MSA wiring, OPM chunking, ESM-C offload, TF32).
