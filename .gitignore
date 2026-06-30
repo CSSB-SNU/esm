@@ -3,3 +3,7 @@ esm.egg-info
 .pixi
 *.egg-info
 *.pyc
+
+# ESMFold2 profiling/folding generated outputs
+logs/
+esmfold2_out/

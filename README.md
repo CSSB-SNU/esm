@@ -349,3 +349,108 @@ If you use ESM in your work, please cite one of the following:
   URL = {https://doi.org/10.5281/zenodo.14219303}
 }
 ```
+
+---
+
+# ESMFold2 folding & profiling scripts (this fork)
+
+This fork adds two scripts under `scripts/`:
+
+- **`run_esmfold2.py`** — fold a protein from a JSON job spec (sequence(s) ± MSA),
+  writing `.cif` + confidence (pTM/PAE/pLDDT).
+- **`profile_esmfold2.py`** — profile inference: per-module time & peak GPU memory,
+  per-block deep dives, Perfetto GPU traces, and TensorBoard profiles.
+
+## Build / install
+
+Environment: a **`uv`-managed venv** on **Python 3.12**. On the cluster, load the
+CUDA toolkit used for any source builds:
+
+```bash
+module load cuda/12.8          # provides nvcc 12.8 at /opt/ohpc/pub/apps/cuda/12.8
+```
+
+Always target the project venv explicitly (the login shell auto-activates a shared
+anaconda; plain `uv pip` would hit that):
+`VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python ...`
+
+**Required**
+
+1. **PyTorch 2.8.0 + cu126** (pinned). `torch.compile` / `apply_torch_compile` for
+   ESMFold2 fails on torch 2.12 (Inductor unbacked-symbol error in the atom
+   unpadding); 2.8.0 is the version Biohub's CI validates.
+   ```bash
+   VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python \
+     --index-url https://download.pytorch.org/whl/cu126 \
+     --extra-index-url https://pypi.org/simple \
+     --index-strategy unsafe-best-match  torch==2.8.0+cu126
+   ```
+2. **Biohub `transformers` fork** (ships `transformers/models/esmfold2`) — pinned in
+   `pyproject.toml` (`transformers @ git+https://github.com/Biohub/transformers`).
+3. **flash-attn** — *required*: `transformers/models/esmc` imports it unguarded, so
+   ESMC won't load without it. No prebuilt wheel exists for this torch; build from
+   source against torch 2.8 with a **clean (non-conda) gcc** toolchain:
+   ```bash
+   srun -p cpu --mem=320G --cpus-per-task=16 bash -c '
+     unset CONDA_PREFIX CPATH CPLUS_INCLUDE_PATH CPPFLAGS DEBUG_CPPFLAGS   # de-conda the build
+     export PATH=$(echo "$PATH" | tr ":" "\n" | grep -v anaconda3 | paste -sd:)
+     export CUDA_HOME=/opt/ohpc/pub/apps/cuda/12.8 PATH=$CUDA_HOME/bin:$PATH
+     export CC=/opt/ohpc/pub/compiler/gcc/9.4.0/bin/gcc CXX=/opt/ohpc/pub/compiler/gcc/9.4.0/bin/g++
+     export MAX_JOBS=8 TORCH_CUDA_ARCH_LIST=8.6 FLASH_ATTENTION_FORCE_BUILD=TRUE
+     VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python flash-attn --no-build-isolation --no-deps'
+   ```
+   (~45 min; high RAM at `MAX_JOBS=8`. **Rebuild whenever torch changes** — it's ABI-pinned.)
+
+**Strongly recommended — cuEquivariance kernels** (the large speedup: ~7–8× trimul):
+```bash
+VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python cuequivariance-torch
+VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python \
+  --extra-index-url https://pypi.nvidia.com cuequivariance-ops-torch-cu12
+```
+`load_model` auto-selects cueq when installed; `_enable_cueq_ops()` preloads the
+ops' `libcue_ops.so` so no manual `LD_LIBRARY_PATH` is needed.
+
+**Optional — profiling viz** (for `profile_esmfold2.py --tensorboard`):
+```bash
+VIRTUAL_ENV=.venv uv pip install --python .venv/bin/python tensorboard torch-tb-profiler
+```
+
+## Run
+
+```bash
+srun -p gpu --gres=gpu:A6000:1 --mem=96G --cpus-per-task=8 \
+  .venv/bin/python scripts/run_esmfold2.py --input job.json --dtype float32
+```
+Defaults to the most efficient path (cueq on trunk **and** MSA trimul + OPM chunking
++ TF32). Add `--offload-lm` for long sequences / 24 GB GPUs. float32 is the supported
+dtype (bf16 has a diffusion LayerNorm dtype issue).
+
+## Our contributions
+
+Optimizations added on top of the stock model (built-in pieces we *enabled* are
+noted as such):
+
+- **cueq-MSA hybrid** *(new)* — the upstream `set_kernel_backend` never reaches the
+  MSA encoder, so its `TriangleMultiplicativeUpdate`s ran pure-PyTorch. We wire cueq
+  into them → **MSA encoder 5–8× faster**, lower peak memory. Now the default.
+- **MSA OuterProductMean chunking** *(enabled an unwired built-in)* — OPM's
+  `[L,L,d_hidden²]` outer product is the largest transient; the chunked path existed
+  but was never wired to the MSA encoder. Enabling it lets large complexes fit
+  (e.g. H2340 @ 2046 res: **OOM → runs** on a 48 GB A6000).
+- **ESM-C CPU offload** (`--offload-lm`, `LMOffloader`) *(new)* — parks the ~24 GB
+  ESMC backbone on CPU during the trunk/diffusion phases; required for long
+  sequences / smaller GPUs.
+- **TF32 on the fp32 diffusion matmuls** *(new)* — matches the paper's inference
+  config (the code didn't set it).
+- **`_enable_cueq_ops()` preload** *(new)* — makes the cueq ops loadable without
+  `LD_LIBRARY_PATH`.
+- **Standard `ESMFold2Model` default** — switched off the deprecated experimental
+  arch and fixed a redundant double-ESMC-load.
+- **`profile_esmfold2.py`** *(new)* — non-invasive profiler: per-module time/peak
+  memory, `--deep` per-block, `--mode {cueq,compile,hybrid,cueq-msa}`,
+  `--torch-trace` (Perfetto GPU+memory), `--tensorboard` (+ allocator memory
+  snapshot), `--offload-lm`, `--kernel-backend`, `--trunk-layers/--msa-layers`,
+  `--opm-chunk`.
+
+Net (float32, A6000): **H2343 142 → 105 s, H1382 470 → 285 s** with lower peak
+memory and unchanged outputs.
