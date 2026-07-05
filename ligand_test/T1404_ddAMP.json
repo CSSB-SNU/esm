@@ -1,0 +1,19 @@
+{
+  "job_name": "T1404_ddAMP",
+  "output_path": "/home/mjkang/software/esm/ligand_test/out",
+  "chains": [
+    {
+      "sequence": "MTTIFELVKDPYERKARVVPGLLVALPLLVPLLCVYGAKHPVLTGVIGLLGGCGAIYALASVARGRGKKLEELLVKKWGGMPTTIALRHRDNFLDSVSKQRYHSAITTKLGIDIPTAEEESANPDKADDIYIGATKRLRELTRTNKQLLLKENIAYGFHRNMLAMKPVGILSSLLGILYGLLIAKVLQITPPHFYPVHFADPGLAAGLTLLISMALLAAWLLYFDQSAVRRMGFVYAERLFECLPSLTSSASRKKAPKSTPTE",
+      "copies": 1,
+      "msa_path": "/home/casp17/run/TS.server/T1404/msa/colab/T1404_unpaired_msa_chains_a.a3m"
+    }
+  ],
+  "ligands": [
+    {
+      "ccd": [
+        "2DA"
+      ],
+      "copies": 1
+    }
+  ]
+}

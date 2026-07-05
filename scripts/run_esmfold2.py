@@ -18,6 +18,20 @@ Job JSON (keys are matched case-insensitively, so the field names below or
       "msa_path": "/path/to/ubiquitin.a3m",   # optional; fold without MSA if absent
       "output_path": "/path/to/outdir"
     }
+
+Ligands (optional) are given as a top-level ``ligands`` list alongside the
+protein chain(s); each entry carries exactly one of ``smiles`` or ``ccd`` (plus
+an optional ``copies``). SMILES ligands require RDKit::
+
+    {
+      "job_name": "kinase_atp",
+      "chains": [{"sequence": "MQIF...", "msa_path": "kinase.a3m"}],
+      "ligands": [
+        {"smiles": "Nc1ncnc2n1cnc2...", "copies": 1},
+        {"ccd": ["MG"], "copies": 2}
+      ],
+      "output_path": "/path/to/outdir"
+    }
 """
 
 from __future__ import annotations
@@ -40,6 +54,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from esm.models.esmfold2 import (
     ESMFold2InputBuilder,
+    LigandInput,
     ProteinInput,
     StructurePredictionInput,
 )
@@ -65,6 +80,10 @@ _KEY_ALIASES = {
     "outdir": "output_path",
     "chains": "chains",
     "subunits": "chains",
+    "ligands": "ligands",
+    "ligand": "ligands",
+    "smiles": "smiles",
+    "ccd": "ccd",
     "copies": "copies",
     "copy": "copies",
     "count": "copies",
@@ -111,12 +130,36 @@ def _parse_chain(raw: dict) -> dict:
     }
 
 
-def load_job(input_path: Path) -> dict:
-    """Parse a job spec into {job_name, output_path, chains: [{sequence, copies, msa_path}]}.
+def _parse_ligand(raw: dict) -> dict:
+    """Normalize one ligand entry: {smiles, ccd, copies}.
 
-    Supports two shapes:
+    Each entry must carry exactly one of ``smiles`` (a SMILES string, tokenized
+    per heavy atom via RDKit) or ``ccd`` (one or more CCD component codes, e.g.
+    ``"ATP"`` or ``["ATP", "MG"]``).
+    """
+    lig = _normalize_keys(raw)
+    smiles = lig.get("smiles") or None
+    ccd = lig.get("ccd") or None
+    if (smiles is None) == (ccd is None):
+        raise ValueError(
+            f"Each ligand needs exactly one of 'smiles' or 'ccd'; got keys {sorted(lig)}."
+        )
+    if isinstance(ccd, str):
+        ccd = [ccd]
+    copies = int(lig.get("copies", 1))
+    if copies < 1:
+        raise ValueError(f"Ligand 'copies' must be >= 1, got {copies}.")
+    return {"smiles": smiles, "ccd": ccd, "copies": copies}
+
+
+def load_job(input_path: Path) -> dict:
+    """Parse a job spec into {job_name, output_path, chains, ligands}.
+
+    ``chains`` is a list of ``{sequence, copies, msa_path}``; ``ligands`` a list of
+    ``{smiles, ccd, copies}``. Supports two protein shapes:
       * single chain — top-level ``sequence`` (+ optional ``msa_path``).
       * complex — a ``chains`` list, each with ``sequence``, ``copies``, ``msa_path``.
+    An optional top-level ``ligands`` list adds non-polymer components to either.
     """
     raw = json.loads(input_path.read_text())
     if not isinstance(raw, dict):
@@ -148,10 +191,18 @@ def load_job(input_path: Path) -> dict:
             "Job spec must contain either a top-level 'sequence' or a 'chains' list."
         )
 
+    ligands: list[dict] = []
+    if "ligands" in job:
+        ligands_raw = job["ligands"]
+        if not isinstance(ligands_raw, list):
+            raise ValueError("'ligands' must be a list of ligand entries.")
+        ligands = [_parse_ligand(lig) for lig in ligands_raw]
+
     return {
         "job_name": job["job_name"],
         "output_path": job["output_path"],
         "chains": chains,
+        "ligands": ligands,
     }
 
 
@@ -431,10 +482,13 @@ def _load_chain_msa(chain: dict, msa_max_depth: int | None) -> MSA | None:
 
 
 def build_input(job: dict, msa_max_depth: int | None) -> StructurePredictionInput:
+    ligands = job.get("ligands", [])
     total_chains = sum(c["copies"] for c in job["chains"])
-    all_ids = _chain_ids(total_chains)
+    total_ligands = sum(lig["copies"] for lig in ligands)
+    # One unique chain ID per entity instance (proteins first, then ligands).
+    all_ids = _chain_ids(total_chains + total_ligands)
 
-    proteins: list[ProteinInput] = []
+    entities: list = []
     cursor = 0
     for idx, chain in enumerate(job["chains"]):
         ids = all_ids[cursor : cursor + chain["copies"]]
@@ -442,7 +496,7 @@ def build_input(job: dict, msa_max_depth: int | None) -> StructurePredictionInpu
         msa = _load_chain_msa(chain, msa_max_depth)
         # ProteinInput.id is a single str for one copy, else a list of IDs.
         chain_id = ids[0] if len(ids) == 1 else ids
-        proteins.append(
+        entities.append(
             ProteinInput(id=chain_id, sequence=chain["sequence"], msa=msa)
         )
         print(
@@ -450,7 +504,18 @@ def build_input(job: dict, msa_max_depth: int | None) -> StructurePredictionInpu
             f"MSA={'depth=' + str(msa.depth) if msa is not None else 'none'}"
         )
 
-    return StructurePredictionInput(sequences=proteins)
+    for idx, lig in enumerate(ligands):
+        ids = all_ids[cursor : cursor + lig["copies"]]
+        cursor += lig["copies"]
+        # LigandInput.id follows the same single-vs-list convention as ProteinInput.
+        lig_id = ids[0] if len(ids) == 1 else ids
+        entities.append(
+            LigandInput(id=lig_id, smiles=lig["smiles"], ccd=lig["ccd"])
+        )
+        desc = f"smiles={lig['smiles']}" if lig["smiles"] else f"ccd={lig['ccd']}"
+        print(f"  ligand group {idx + 1}: ids={ids}, {desc}")
+
+    return StructurePredictionInput(sequences=entities)
 
 
 def write_outputs(
@@ -547,7 +612,10 @@ def plot_pae(panels: list[dict], job: dict) -> Path | None:
     ranked = sorted(
         panels, key=lambda p: (p["ptm"] is not None, p["ptm"] or 0.0), reverse=True
     )
-    boundaries = _chain_boundaries(job)[:-1]  # drop the final (== total) boundary
+    # Cumulative protein-chain ends. The final entry equals total protein
+    # residues: for a protein-only job that's the matrix edge (guarded out
+    # below); with ligands appended it becomes the polymer/ligand divider.
+    boundaries = _chain_boundaries(job)
     n = len(ranked)
     fig, axes = plt.subplots(1, n, figsize=(3.2 * n, 3.6), squeeze=False)
     im = None
@@ -679,9 +747,11 @@ def main(argv: list[str] | None = None) -> int:
     job = load_job(args.input)
     total_chains = sum(c["copies"] for c in job["chains"])
     total_res = sum(len(c["sequence"]) * c["copies"] for c in job["chains"])
+    n_ligands = sum(lig["copies"] for lig in job.get("ligands", []))
+    lig_msg = f", {n_ligands} ligand(s)" if n_ligands else ""
     print(
         f"Job '{job['job_name']}': {len(job['chains'])} unique chain(s), "
-        f"{total_chains} chains total, {total_res} residues."
+        f"{total_chains} chains total, {total_res} residues{lig_msg}."
     )
 
     msa_max_depth = args.msa_max_depth if args.msa_max_depth > 0 else None

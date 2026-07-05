@@ -1,0 +1,24 @@
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+WARNING[XFORMERS]: xFormers can't load C++/CUDA extensions. xFormers was built for:
+    PyTorch 2.10.0+cu128 with CUDA 1208 (you have 2.8.0+cu126)
+    Python  3.10.19 (you have 3.12.10)
+  Please reinstall xformers (see https://github.com/facebookresearch/xformers#installing-xformers)
+  Memory-efficient attention, SwiGLU, sparse and more won't be available.
+  Set XFORMERS_MORE_DETAILS=1 for more details
+ESMC: transformer_engine is not installed; falling back to pure-PyTorch LayerNorm+Linear / LayerNorm+MLP. Outputs will differ numerically — measured on the unnormalized residual stream (before the final LayerNorm), ~O(10) max-diff in fp32 and ~O(100) in bf16; after the final LayerNorm these shrink to a few ULP and perplexity stays within rounding noise. Install with `pip install transformer-engine[pytorch]` to enable fused fp32-reduction LayerNorm.
+Job 'T1404_ddAMP': 1 unique chain(s), 1 chains total, 263 residues, 1 ligand(s).
+Loading biohub/ESMFold2 in torch.float32 (this pulls the ESMC backbone on first run)...
+🚨 No checkpoint found for ESMCForSequenceClassification.forward. Please add a `checkpoint` arg to `auto_docstring` or add one in ESMCConfig's docstring
+🚨 No checkpoint found for ESMCForTokenClassification.forward. Please add a `checkpoint` arg to `auto_docstring` or add one in ESMCConfig's docstring
+Loading checkpoint shards:   0%|          | 0/6 [00:00<?, ?it/s]Loading checkpoint shards:  17%|█▋        | 1/6 [00:00<00:04,  1.02it/s]Loading checkpoint shards:  33%|███▎      | 2/6 [00:01<00:03,  1.04it/s]Loading checkpoint shards:  50%|█████     | 3/6 [00:02<00:02,  1.02it/s]Loading checkpoint shards:  67%|██████▋   | 4/6 [00:03<00:01,  1.04it/s]Loading checkpoint shards:  83%|████████▎ | 5/6 [00:04<00:00,  1.08it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:04<00:00,  1.45it/s]Loading checkpoint shards: 100%|██████████| 6/6 [00:04<00:00,  1.21it/s]
+Acceleration: cueq-msa hybrid (cueq everywhere incl. 8 MSA trimuls) + OPM chunk=64 x4
+Loading CCD dictionary from /home/mjkang/.cache/huggingface/hub/models--biohub--ESMFold2/snapshots/1ebf0e3481a5184eb6171d40615c79e384b48796/ccd.pkl
+  chain group 1: ids=['A'], len=263, MSA=depth=1024
+  ligand group 1: ids=['B'], ccd=['2DA']
+Folding (seed=1, samples=1)...
+  seed=1 sample=0: pTM=0.807, mean pLDDT=0.808
+
+Done.
+PAE plot: /home/mjkang/software/esm/ligand_test/out/T1404_ddAMP_pae.png
+Wrote 5 files to /home/mjkang/software/esm/ligand_test/out
