@@ -497,6 +497,94 @@ def write_outputs(
     return written, confidence
 
 
+# --------------------------------- PAE plot --------------------------------- #
+
+
+# Standard max expected aligned error in Å (AlphaFold PAE scale); fixes the
+# colour range so panels are comparable across structures.
+PAE_VMAX = 31.75
+
+
+def _chain_boundaries(job: dict) -> list[int]:
+    """Cumulative residue counts at the end of each chain instance (copies expanded).
+
+    Used to draw chain-block dividers on the PAE plot. The final entry equals the
+    total residue count; the internal entries mark inter-chain boundaries. Assumes
+    the PAE residue order matches the chain concatenation order in ``build_input``.
+    """
+    bounds: list[int] = []
+    total = 0
+    for chain in job["chains"]:
+        for _ in range(chain["copies"]):
+            total += len(chain["sequence"])
+            bounds.append(total)
+    return bounds
+
+
+def plot_pae(panels: list[dict], job: dict) -> Path | None:
+    """Render a ranked row of PAE heatmaps — one panel per predicted structure.
+
+    ``panels`` entries are ``{"pae": np.ndarray | None, "ptm", "seed", "sample"}``.
+    Panels are ordered best-pTM-first (rank 1 = highest pTM), matching the
+    ``{job_name}_models.json`` ranking. Chain boundaries are drawn as red dividers
+    so the inter-chain (interface) PAE blocks stand out. Returns the PNG path, or
+    ``None`` if there is nothing to plot / matplotlib is unavailable.
+    """
+    panels = [p for p in panels if p.get("pae") is not None]
+    if not panels:
+        return None
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")  # headless: no display on the cluster nodes.
+        import matplotlib.pyplot as plt
+    except ImportError:
+        warnings.warn(
+            "matplotlib not installed; skipping PAE plot.", stacklevel=2
+        )
+        return None
+
+    ranked = sorted(
+        panels, key=lambda p: (p["ptm"] is not None, p["ptm"] or 0.0), reverse=True
+    )
+    boundaries = _chain_boundaries(job)[:-1]  # drop the final (== total) boundary
+    n = len(ranked)
+    fig, axes = plt.subplots(1, n, figsize=(3.2 * n, 3.6), squeeze=False)
+    im = None
+    for ax, p, rank in zip(axes[0], ranked, range(1, n + 1)):
+        pae = p["pae"]
+        im = ax.imshow(
+            pae, cmap="Blues_r", vmin=0, vmax=PAE_VMAX, interpolation="nearest"
+        )
+        length = pae.shape[0]
+        for b in boundaries:
+            if 0 < b < length:
+                ax.axhline(b - 0.5, color="red", lw=0.8)
+                ax.axvline(b - 0.5, color="red", lw=0.8)
+        ptm = f"{p['ptm']:.3f}" if p["ptm"] is not None else "n/a"
+        ax.set_title(
+            f"Rank {rank}  pTM={ptm}\nseed {p['seed']} sample {p['sample']}",
+            fontsize=8,
+        )
+        ax.set_xlabel("Scored residue")
+        if rank == 1:
+            ax.set_ylabel("Aligned residue")
+        ax.tick_params(labelsize=6)
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.046, pad=0.02)
+        cbar.set_label("Expected position error (Å)", fontsize=8)
+        cbar.ax.tick_params(labelsize=6)
+    fig.suptitle(f"{job['job_name']} — Predicted Aligned Error", fontsize=10)
+
+    out_dir = Path(job["output_path"]).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{job['job_name']}_pae.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 # ----------------------------------- CLI ------------------------------------ #
 
 
@@ -576,6 +664,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable cuequivariance kernels everywhere (trunk/diffusion/confidence "
         "AND the MSA-encoder trimul) — use pure-PyTorch / compile only.",
     )
+    parser.add_argument(
+        "--no-pae-plot",
+        action="store_true",
+        help="Skip writing {job_name}_pae.png (a ranked row of PAE heatmaps, one "
+        "panel per predicted structure). Plotting requires matplotlib.",
+    )
     return parser.parse_args(argv)
 
 
@@ -624,6 +718,7 @@ def main(argv: list[str] | None = None) -> int:
 
     summaries: list[dict] = []
     written: list[Path] = []
+    panels: list[dict] = []  # PAE + rank keys, one per structure, for the plot
     for seed in seeds:
         print(f"Folding (seed={seed}, samples={n_samples})...")
         results = builder.fold(
@@ -639,11 +734,33 @@ def main(argv: list[str] | None = None) -> int:
         # fold() returns a single result when num_diffusion_samples == 1.
         results = results if isinstance(results, list) else [results]
         for i, result in enumerate(results):
-            # Tag files only when more than one structure is produced.
-            tag = f"_seed{seed}_sample{i}" if multi else ""
+            # Tag files by the output's identity, not by whether THIS invocation
+            # happens to produce multiple structures. Otherwise separate runs
+            # that each fold one seed (e.g. a shell loop over --seed) all share
+            # num_seeds==1 / n_samples==1, collapse to tag="", and clobber the
+            # same {job_name}.cif. Seed appears whenever it is set; the sample
+            # index appears whenever a fold produced more than one structure.
+            parts = []
+            if seed is not None:
+                parts.append(f"_seed{seed}")
+            if len(results) > 1:
+                parts.append(f"_sample{i}")
+            tag = "".join(parts)
             files, conf = write_outputs(result, job, tag=tag, seed=seed, sample=i)
             written.extend(files)
             summaries.append(conf)
+            panels.append(
+                {
+                    "pae": (
+                        result.pae.detach().cpu().numpy()
+                        if result.pae is not None
+                        else None
+                    ),
+                    "ptm": conf["ptm"],
+                    "seed": seed,
+                    "sample": i,
+                }
+            )
             ptm = f"{conf['ptm']:.3f}" if conf["ptm"] is not None else "n/a"
             mp = f"{conf['mean_plddt']:.3f}" if conf["mean_plddt"] is not None else "n/a"
             print(f"  seed={seed} sample={i}: pTM={ptm}, mean pLDDT={mp}")
@@ -663,6 +780,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print("\nDone.")
+
+    if not args.no_pae_plot:
+        pae_png = plot_pae(panels, job)
+        if pae_png is not None:
+            written.append(pae_png)
+            print(f"PAE plot: {pae_png}")
+        elif any(p["pae"] is not None for p in panels):
+            print("PAE plot skipped (matplotlib unavailable).")
+        else:
+            print("PAE plot skipped (no PAE in model output).")
+
     print(f"Wrote {len(written)} files to {job['output_path']}")
     return 0
 
