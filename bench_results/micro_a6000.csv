@@ -1,0 +1,13 @@
+target,backend,seq_len,dtype,chunk,eager_ms_median,graph_ms_median,speedup_vs_baseline,peak_gb,delta_peak_gb,max_abs_err,max_rel_err,accuracy_verdict,graph_vs_eager_ok,graph_status
+pair_update_block,none,256,float32,64,27.8472,27.8697,,0.9574,,0.0,0.0,PASS,True,ok
+pair_update_block,fused,256,bfloat16,64,3.7821,3.7484,7.363,0.4398,-0.5176,0.053658,0.008762,PASS,True,ok
+pair_update_block,none,512,float32,64,209.2052,209.1802,,3.7945,,0.0,0.0,PASS,True,ok
+pair_update_block,fused,512,bfloat16,64,15.3544,15.2105,13.625,1.6745,-2.12,0.054662,0.008222,PASS,True,ok
+transition,none,256,float32,64,5.1313,5.0821,,0.5535,,0.0,0.0,PASS,True,ok
+transition,fused,256,bfloat16,64,1.8483,1.5759,2.776,0.4047,-0.1488,0.030965,0.005638,PASS,True,ok
+transition,none,512,float32,64,19.9127,19.8446,,1.5693,,0.0,0.0,PASS,True,ok
+transition,fused,512,bfloat16,64,7.1148,7.0415,2.799,1.2019,-0.3674,0.030965,0.005438,PASS,True,ok
+attention_pair_bias,none,256,float32,64,0.5852,0.5386,,0.2542,,0.0,0.0,PASS,True,ok
+attention_pair_bias,fused,256,bfloat16,64,0.3953,0.2806,1.481,0.2176,-0.0366,4.7e-05,0.008383,PASS,True,ok
+attention_pair_bias,none,512,float32,64,2.2528,2.2006,,0.6758,,0.0,0.0,PASS,True,ok
+attention_pair_bias,fused,512,bfloat16,64,0.9359,0.8448,2.407,0.5293,-0.1465,3.1e-05,0.008219,PASS,True,ok
