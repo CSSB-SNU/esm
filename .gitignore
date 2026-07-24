@@ -7,3 +7,7 @@ esm.egg-info
 # ESMFold2 profiling/folding generated outputs
 logs/
 esmfold2_out/
+examples/
+*.sqlite
+*.nsys-rep
+*.ncu-rep

@@ -209,10 +209,18 @@ def load_job(input_path: Path) -> dict:
 # ------------------------------- model loading ------------------------------ #
 
 
+# float32 only. ESMFold2 is mixed-precision BY DESIGN, handled internally: the
+# forward wraps the trunk / MSA / pair-transition in `torch.amp.autocast(bf16)`
+# (weights stay fp32; only matmul inputs downcast), then upcasts to fp32 for the
+# diffusion module (fp32 + TF32) and confidence/distogram head. A blanket
+# `model.to(dtype=bf16/fp16)` casts those fp32-by-design submodules too, which
+# both crashes (`mat1 and mat2 must have the same dtype` at the distogram head,
+# where an fp32 activation meets a bf16 weight outside the autocast region) and,
+# where it doesn't crash, reintroduces the diffusion-module instabilities the
+# paper explicitly avoids. So there is no valid reduced-precision blanket cast —
+# fp32 storage + the model's own autocast already gives the paper's precision.
 _DTYPES = {
     "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
 }
 
 
@@ -678,9 +686,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dtype",
         default="float32",
         choices=list(_DTYPES),
-        help="Compute/weights dtype. float32 is the reference path (fits a 48 GB "
-        "GPU; ESMC-6B is ~24 GB). bfloat16/float16 halve memory but the blanket "
-        "cast can hit dtype mismatches in the fp32 diffusion path; use with care.",
+        help="Weight-storage dtype. Only float32 is supported: ESMFold2 is "
+        "mixed-precision internally (autocast bf16 for the trunk, fp32+TF32 for "
+        "the diffusion module and confidence head), so a blanket bf16/fp16 cast "
+        "breaks the fp32-by-design submodules. See the _DTYPES comment.",
     )
     parser.add_argument("--num-loops", type=int, default=16)
     parser.add_argument("--num-sampling-steps", type=int, default=200)

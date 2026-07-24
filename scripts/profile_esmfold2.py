@@ -24,9 +24,9 @@ Two modes:
 Example
 -------
     srun --gres=gpu:1 --pty python scripts/profile_esmfold2.py \
-        --input job.json --dtype bfloat16
+        --input job.json
     srun --gres=gpu:1 --pty python scripts/profile_esmfold2.py \
-        --input H2343.json --dtype bfloat16 --deep
+        --input H2343.json --deep
 """
 
 from __future__ import annotations
