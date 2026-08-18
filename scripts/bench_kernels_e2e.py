@@ -49,6 +49,7 @@ from run_esmfold2 import (  # noqa: E402
     load_job,
     load_model,
 )
+from chunk_confidence import install_chunked_confidence  # noqa: E402
 
 try:
     from transformers.models.esmfold2.modeling_esmfold2_common import (
@@ -96,7 +97,16 @@ class ForwardTimer:
         self.times.clear()
 
 
+def _peel_cchunk(name: str) -> tuple[str, bool]:
+    """Peel a trailing '+cchunk' -> (base, chunk_confidence). Runs the confidence
+    head one diffusion sample at a time; it sets the fold's memory peak."""
+    if name.endswith("+cchunk"):
+        return name[: -len("+cchunk")], True
+    return name, False
+
+
 def backend_available(name: str) -> tuple[bool, str]:
+    name = _peel_cchunk(name)[0]
     if name == "none":
         return True, ""
     if name == "fused":
@@ -109,8 +119,24 @@ def backend_available(name: str) -> tuple[bool, str]:
 
 def apply_backend(model, name: str, opm_chunk: int | None) -> None:
     """Apply a built-in kernel backend for the A/B. OPM chunking is held fixed
-    across backends so the delta isolates the kernel, not the memory tiling."""
-    model.set_kernel_backend(None if name == "none" else name)
+    across backends so the delta isolates the kernel, not the memory tiling.
+
+    A trailing ``+cchunk`` (e.g. ``none+cchunk``) additionally runs the confidence
+    head one diffusion sample at a time. The model is REUSED across backends, so
+    a prior install must be reverted first or it would leak into the next row and
+    silently change what the A/B is measuring."""
+    prev = getattr(model, "_cc_revert", None)
+    if prev is not None:
+        if hasattr(prev, "stats"):
+            print(f"  [prev chunked-confidence stats] {prev.stats}")
+        prev()
+        model._cc_revert = None
+
+    base, want_cchunk = _peel_cchunk(name)
+    model.set_kernel_backend(None if base == "none" else base)
+    if want_cchunk:
+        model._cc_revert = install_chunked_confidence(model, chunk=1)
+        print(f"  {name}: confidence head chunked to 1 diffusion sample")
     if opm_chunk is not None:
         _set_msa_opm_chunk(model, opm_chunk)
 
@@ -126,7 +152,7 @@ def run_fold(builder, model, spec, args, seed):
         model, spec,
         num_loops=args.num_loops,
         num_sampling_steps=args.num_sampling_steps,
-        num_diffusion_samples=1,
+        num_diffusion_samples=args.num_diffusion_samples,
         seed=seed,
         msa_max_depth=msa_max_depth,
         complex_id="bench",
@@ -225,7 +251,11 @@ def main(argv=None) -> int:
         fwd_ms = (sum(timer.times) / max(1, len(timer.times))) * 1e3
 
         res = _as_result(last)
-        if name == "none":
+        # The FIRST measured row is the reference, whatever it is called. Keying
+        # this on `name == "none"` left ref_result unset for any run whose first
+        # backend was not literally "none" (e.g. `--backends none+cchunk`, or
+        # `--backends fused,none`), and the next row then dereferenced None.
+        if ref_result is None:
             ref_result = res
             baseline_ms = fwd_ms
             baseline_peak = peak
@@ -323,6 +353,9 @@ def parse_args(argv=None):
     p.add_argument("--dtype", default="float32", choices=list(_DTYPES))
     p.add_argument("--num-loops", type=int, default=2)
     p.add_argument("--num-sampling-steps", type=int, default=20)
+    p.add_argument("--num-diffusion-samples", type=int, default=1,
+                   help="Diffusion samples per fold. The confidence head's peak\n"
+                        "memory grows with this; see '+cchunk'.")
     p.add_argument("--msa-max-depth", type=int, default=1024)
     p.add_argument("--trunk-layers", type=int, default=None,
                    help="Truncate folding_trunk to N blocks (faster A/B).")
