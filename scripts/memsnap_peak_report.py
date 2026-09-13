@@ -32,6 +32,83 @@ from memsnap_to_trace import _pick_name, _py_frames, _stack_lines  # noqa: E402
 _GB = 2**30
 _MB = 2**20
 
+# ---------------------------------------------------------------------------
+# Phase classification: which model module was running when a block was
+# allocated. Primary signal: distinctive method names in the stack. Fallback:
+# the call-site LINE inside the top-level ESMFold2 forward (the outermost
+# `modeling_esmfold2.py: forward` frame) — we read that source line and pull
+# `self.<attr>` out of it, so the labels track the installed code, not
+# hard-coded line numbers.
+# ---------------------------------------------------------------------------
+
+_SRC_CACHE: dict[str, list[str]] = {}
+_PHASE_MARKERS = (
+    ("compute_lm_hidden_states", "esm-c (LM)"),
+    ("_to_gpu", "esm-c (LM)"),           # LM offloader weight upload
+    ("_run_one_loop", "pair_trunk+msa (recycles)"),
+    ("prepare_input", "input prep"),
+)
+
+
+def _phase_of(frames: list[dict]) -> str:
+    py = _py_frames(frames)
+    top = None  # outermost top-level ESMFold2Model.forward frame
+    for f in py:
+        nm = f["name"]
+        for marker, label in _PHASE_MARKERS:
+            if nm == marker:
+                return label
+        if nm == "sample" and "modeling_esmfold2_common" in f["filename"]:
+            return "diffusion (sample)"
+        if nm == "forward" and f["filename"].endswith("modeling_esmfold2.py"):
+            top = f  # keep the last (outermost) one
+    if top is not None:
+        fn = top["filename"]
+        if fn not in _SRC_CACHE:
+            try:
+                _SRC_CACHE[fn] = Path(fn).read_text().splitlines()
+            except OSError:
+                _SRC_CACHE[fn] = []
+        lines = _SRC_CACHE[fn]
+        if 0 < top["line"] <= len(lines):
+            m = re.search(r"self\.(\w+)", lines[top["line"] - 1])
+            if m:
+                return m.group(1)
+    return "other"
+
+
+def build_phase_bands(trace: list[dict], t0: int,
+                      min_frac: float = 0.004) -> list[tuple[int, int, str]]:
+    """Run-length-encode alloc-event phases into contiguous time bands."""
+    pts = [(e["time_us"] - t0, _phase_of(e.get("frames") or []))
+           for e in trace if e["action"] == "alloc"]
+    if not pts:
+        return []
+    bands: list[list] = []
+    for ts, ph in pts:
+        if bands and bands[-1][2] == ph:
+            bands[-1][1] = ts
+        else:
+            bands.append([ts, ts, ph])
+    # Drop micro-bands (glue allocations misattributed between phases), then
+    # merge adjacent bands that became equal and butt bands together so the
+    # axis is gapless.
+    span = pts[-1][0] - pts[0][0]
+    bands = [b for b in bands if (b[1] - b[0]) >= span * min_frac or b is bands[-1]]
+    merged: list[list] = []
+    for b in bands:
+        if merged and merged[-1][2] == b[2]:
+            merged[-1][1] = b[1]
+        else:
+            merged.append(b)
+    for a, b in zip(merged, merged[1:]):
+        a[1] = b[0]
+    return [(s, e, ph) for s, e, ph in merged]
+
+
+_BAND_COLORS = ["#dbeafe", "#dcfce7", "#fef3c7", "#fce7f3", "#ede9fe",
+                "#cffafe", "#fee2e2", "#e2e8f0"]
+
 
 def build_report(snap_path: Path, out_path: Path, crop_after: str | None,
                  min_mb: float, device: int) -> None:
@@ -98,12 +175,32 @@ def build_report(snap_path: Path, out_path: Path, crop_after: str | None,
         curve = ds
 
     # ---- SVG chart -------------------------------------------------------- #
-    W, H, PAD = 1000, 260, 45
+    W, H, PAD = 1000, 300, 45
     ts0, ts1 = curve[0][0], curve[-1][0]
     ymax = max(p[1] for p in curve) * 1.05
     def sx(t): return PAD + (t - ts0) / max(ts1 - ts0, 1) * (W - 2 * PAD)
     def sy(v): return H - PAD + (-v / ymax) * (H - 2 * PAD)
     pts = " ".join(f"{sx(t):.1f},{sy(v):.1f}" for t, v in curve)
+
+    # Phase bands on the x-axis (module active per time region).
+    bands = [(max(s, ts0), min(e, ts1), ph)
+             for s, e, ph in build_phase_bands(trace, t0) if e > ts0 and s < ts1]
+    colors = {}
+    band_svg = []
+    for i, (s, e, ph) in enumerate(bands):
+        c = colors.setdefault(ph, _BAND_COLORS[len(colors) % len(_BAND_COLORS)])
+        x0, x1 = sx(s), sx(e)
+        band_svg.append(f'<rect x="{x0:.1f}" y="{PAD}" width="{x1-x0:.1f}" '
+                        f'height="{H-2*PAD}" fill="{c}" opacity="0.55">'
+                        f'<title>{html.escape(ph)}: {s/1e6:.2f}-{e/1e6:.2f}s</title></rect>')
+        # Label below the axis; stagger rows so narrow neighbours don't collide.
+        y = H - PAD + 30 + (i % 2) * 13
+        band_svg.append(f'<line x1="{x0:.1f}" y1="{H-PAD}" x2="{x0:.1f}" '
+                        f'y2="{y-9}" class="bandtick"/>')
+        label = ph if (x1 - x0) > 7 * len(ph) or (i % 2 == 0) else ph[:14]
+        band_svg.append(f'<text x="{(x0+x1)/2:.1f}" y="{y}" class="bandlab" '
+                        f'fill="#334155">{html.escape(label)}</text>')
+
     gridlines = []
     for frac in (0.25, 0.5, 0.75, 1.0):
         v = ymax * frac
@@ -116,7 +213,7 @@ def build_report(snap_path: Path, out_path: Path, crop_after: str | None,
         xticks.append(f'<text x="{sx(t):.1f}" y="{H-PAD+16}" class="xlab">{t/1e6:.1f}s</text>')
     svg = f"""
 <svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg">
-  {''.join(gridlines)}{''.join(xticks)}
+  {''.join(band_svg)}{''.join(gridlines)}{''.join(xticks)}
   <polyline points="{pts}" fill="none" stroke="var(--line)" stroke-width="1.4"/>
   <line x1="{sx(peak_ts):.1f}" y1="{PAD}" x2="{sx(peak_ts):.1f}" y2="{H-PAD}" class="peakline"/>
   <text x="{min(sx(peak_ts)+6, W-260):.1f}" y="{PAD+14}" class="peaklab">peak {peak_b/_GB:.2f} GB @ {peak_ts/1e6:.2f}s</text>
@@ -153,6 +250,7 @@ h1 {{ font-size: 17px; }} h2 {{ font-size: 14px; margin-top: 28px; }}
 .grid {{ stroke:#ddd; stroke-width:1; }} .ylab,.xlab {{ font-size:10px; fill:#666; }}
 .ylab {{ text-anchor:end; }} .xlab {{ text-anchor:middle; }}
 .peakline {{ stroke:#dc2626; stroke-dasharray:4 3; }} .peaklab {{ fill:#dc2626; font-size:11px; }}
+.bandlab {{ font-size:10px; text-anchor:middle; }} .bandtick {{ stroke:#94a3b8; stroke-width:0.7; }}
 table {{ border-collapse: collapse; width: 100%; }}
 td, th {{ padding: 3px 8px; border-bottom: 1px solid #e5e5e5; vertical-align: top; text-align:left; }}
 td.num, th.num {{ text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }}
