@@ -132,6 +132,7 @@ def build_report(snap_path: Path, out_path: Path, crop_after: str | None,
     live: dict[int, dict] = {}
     peak = (-1, -1)  # (bytes, ts)
     peak_live: list[dict] | None = None
+    n_free = n_unmatched = 0
     for e in trace:
         ts = e["time_us"] - t0
         if e["action"] == "alloc":
@@ -139,7 +140,9 @@ def build_report(snap_path: Path, out_path: Path, crop_after: str | None,
             live[e["addr"]] = e
         elif e["action"] == "free_completed":
             allocated -= e["size"]
-            live.pop(e["addr"], None)
+            n_free += 1
+            if live.pop(e["addr"], None) is None:
+                n_unmatched += 1
         else:
             continue
         if ts >= t_crop:
@@ -149,6 +152,16 @@ def build_report(snap_path: Path, out_path: Path, crop_after: str | None,
                 peak_live = list(live.values())
     assert peak_live is not None, "empty region after crop"
     peak_b, peak_ts = peak
+    # Frees whose alloc is missing mean the recording ring wrapped (history
+    # kept only the last max_entries events) — the true peak may be OUTSIDE
+    # the retained window and the absolute level is unreliable.
+    warn = ""
+    if n_free and n_unmatched / n_free > 0.02:
+        warn = (f"⚠ {n_unmatched}/{n_free} frees have no recorded alloc — the "
+                f"memory-history ring buffer wrapped (snapshot holds only the "
+                f"tail of the run). Peak location/level below is UNRELIABLE; "
+                f"re-record with a larger max_entries.")
+        print(f"  [WARN] {warn}")
 
     # Group the live-at-peak blocks by source.
     groups: dict[str, dict] = {}
@@ -260,6 +273,7 @@ summary {{ cursor: pointer; list-style:none; }} summary::-webkit-details-marker 
 .meta {{ color: var(--mut); }}
 </style>
 <h1>GPU memory report — {html.escape(title)}</h1>
+{f'<p style="background:#fef2f2;border:1px solid #fca5a5;padding:8px;color:#991b1b">{html.escape(warn)}</p>' if warn else ''}
 <p class="meta">window {ts0/1e6:.1f}–{ts1/1e6:.1f} s{f' (cropped at {t_crop/1e6:.1f} s: everything before the last match of <code>{html.escape(crop_after)}</code> removed)' if t_crop else ''}
  · <b>peak allocated {peak_b/_GB:.2f} GB</b> at {peak_ts/1e6:.2f} s · {len(peak_live)} live blocks at peak</p>
 {svg}
