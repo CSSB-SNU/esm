@@ -71,13 +71,32 @@ def _stack_lines(frames: list[dict], limit: int = 25) -> list[str]:
             for f in _py_frames(frames)[:limit]]
 
 
-def convert(snap_path: Path, out_path: Path, min_mb: float, device: int) -> None:
+def convert(snap_path: Path, out_path: Path, min_mb: float, device: int,
+            crop_after: str | None = None) -> None:
     snap = pickle.load(open(snap_path, "rb"))
     trace = snap["device_traces"][device]
     if not trace:
         raise SystemExit(f"device {device} has no events in {snap_path}")
 
     t0 = min(e["time_us"] for e in trace)
+
+    # --crop-after: drop the leading part of the window up to (and including)
+    # the LAST allocation whose python stack matches the regex. Running totals
+    # and block lifetimes are still computed from the full stream, so blocks
+    # alive at the crop appear from the crop point (args.preexisting=true) and
+    # the counter starts at the true baseline, not zero.
+    t_crop = 0
+    if crop_after:
+        import re
+        pat = re.compile(crop_after)
+        for e in trace:
+            if e["action"] != "alloc":
+                continue
+            if any(pat.search(f["filename"]) or pat.search(f["name"])
+                   for f in _py_frames(e.get("frames") or [])):
+                t_crop = max(t_crop, e["time_us"] - t0 + 1)
+        if t_crop == 0:
+            print(f"[warn] --crop-after {crop_after!r} matched nothing; no crop")
     events: list[dict] = [
         {"ph": "M", "pid": 0, "name": "process_name",
          "args": {"name": f"GPU{device} memory ({snap_path.name})"}},
@@ -87,6 +106,7 @@ def convert(snap_path: Path, out_path: Path, min_mb: float, device: int) -> None
 
     # ---- counter track (every event) ------------------------------------- #
     allocated = reserved = peak = 0
+    baseline = (0, 0)
     live: dict[int, dict] = {}  # addr -> block
     blocks: list[dict] = []
     for e in trace:
@@ -109,6 +129,9 @@ def convert(snap_path: Path, out_path: Path, min_mb: float, device: int) -> None
             reserved -= e["size"]
         else:
             continue
+        if ts < t_crop:
+            baseline = (allocated, reserved)
+            continue
         events.append({"ph": "C", "pid": 0, "name": "GPU memory", "ts": ts,
                        "args": {"allocated_MB": round(allocated / 2**20, 1),
                                 "reserved_MB": round(reserved / 2**20, 1)}})
@@ -116,6 +139,15 @@ def convert(snap_path: Path, out_path: Path, min_mb: float, device: int) -> None
     for b in live.values():  # still live at snapshot end
         b["end"] = t_end
         blocks.append(b)
+    if t_crop:
+        events.append({"ph": "C", "pid": 0, "name": "GPU memory", "ts": t_crop,
+                       "args": {"allocated_MB": round(baseline[0] / 2**20, 1),
+                                "reserved_MB": round(baseline[1] / 2**20, 1)}})
+        blocks = [b for b in blocks if b["end"] > t_crop]
+        for b in blocks:
+            if b["ts"] < t_crop:
+                b["ts"] = t_crop
+                b["preexisting"] = True
 
     # ---- per-allocation lane events --------------------------------------- #
     min_bytes = int(min_mb * 2**20)
@@ -137,6 +169,7 @@ def convert(snap_path: Path, out_path: Path, min_mb: float, device: int) -> None
             "name": _pick_name(b["frames"]),
             "args": {"size_MB": round(b["size"] / 2**20, 2),
                      "stream": b["stream"],
+                     "preexisting_at_crop": bool(b.get("preexisting")),
                      "stack": _stack_lines(b["frames"])},
         })
 
@@ -162,12 +195,19 @@ def main() -> int:
     ap.add_argument("--min-mb", type=float, default=1.0,
                     help="lane view includes allocations >= this size (MB)")
     ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--crop-after", default=None, metavar="REGEX",
+                    help="drop everything up to the LAST allocation whose "
+                         "python stack matches REGEX. E.g. exclude the ESM-C "
+                         "language-model phase with "
+                         "'compute_lm_hidden_states|esmc'. Blocks still alive "
+                         "at the crop are kept (args.preexisting_at_crop).")
     args = ap.parse_args()
     if args.out is not None and len(args.snapshot) > 1:
         raise SystemExit("-o only valid with a single snapshot")
     for sp in args.snapshot:
-        out = args.out or sp.with_suffix(".trace.json.gz")
-        convert(sp, out, args.min_mb, args.device)
+        suffix = ".fold.trace.json.gz" if args.crop_after else ".trace.json.gz"
+        out = args.out or sp.with_suffix(suffix)
+        convert(sp, out, args.min_mb, args.device, args.crop_after)
     return 0
 
 
